@@ -41,7 +41,7 @@ module.exports = {
 
 	startPolling() {
 		let self = this
-		self.logDebug('Start polling')
+		self.log('debug', 'Start polling')
 		self.pollTimer = setInterval(() => {
 			self.getData()
 		}, 10000)
