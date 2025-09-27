@@ -27,9 +27,6 @@ module.exports = {
 		self.socket.on('connect', () => {
 			self.updateStatus(InstanceStatus.Ok)
 			self.log('info', 'Connected')
-			self.getData() // seed queue
-			this.drainQueue() // kick off send of first command
-			self.startPolling()
 		})
 
 		self.socket.on('data', (buffer) => {
@@ -126,14 +123,15 @@ module.exports = {
 		if (/\bpassword\b/i.test(data)) {
 			self.updateStatus(InstanceStatus.UnknownWarning, 'Authenticating')
 			self.log('info', 'Authentication requested. Sending password.')
-			// If your device needs a command wrapper, adjust here:
-			// e.g. self.sendCommand(`password,${self.config.password}`)
 			self.sendCommand(self.config.password)
 			return
 		}
 		if (lower.includes('welcome')) {
 			self.updateStatus(InstanceStatus.Ok)
 			self.log('info', 'Authenticated.')
+			self.getData() // seed queue
+			this.drainQueue() // kick off send of first command
+			self.startPolling()
 			return
 		}
 
@@ -142,7 +140,6 @@ module.exports = {
 			try {
 				const parts = data.split(',')
 				// parts[0] = 'ack'
-				// Do whatever you need with category/id/subId/value here
 
 				// send the next queued command
 				if (typeof self._onAck === 'function') self._onAck()
@@ -158,11 +155,14 @@ module.exports = {
 			// ...
 			return
 		}
+		
+		self.sendCommand(self.cmdQueue.shift()) // send the next command
+
 		//do stuff with the data
 		try {
 			if (data.indexOf('ack') !== -1) {
 				//acknowledgment received, send next command in queue
-				self.sendCommand(self.cmdQueue.shift())
+				
 
 				//process the ack
 				//acks look like this: ack,97,46,0,[a][lf ]
