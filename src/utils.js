@@ -17,6 +17,8 @@ module.exports = {
 		if (self.config.host) {
 			self.socket = new TCPHelper(self.config.host, self.config.port)
 
+			let databuffer = ''
+
 			self.socket.on('error', function (err) {
 				self.log('error', 'Network error: ' + err.message)
 				self.stopPolling()
@@ -33,8 +35,15 @@ module.exports = {
 
 			self.socket.on('data', function (buffer) {
 				let indata = buffer.toString('utf8')
-				//update feedbacks and variables
-				self.updateData(indata)
+
+				databuffer += indata
+				//if a newline is present, process the data and clear databuffer
+				let newlineIndex = databuffer.indexOf('\n')
+				if (newlineIndex !== -1) {
+					//update feedbacks and variables
+					self.updateData(databuffer)
+					databuffer = ''
+				}
 			})
 		}
 	},
@@ -105,11 +114,11 @@ module.exports = {
 			self.log('debug', 'Received: ' + data)
 		}
 
-		if (data.trim() == 'Enter password:') {
+		if (data.trim().toLowerCase().indexOf('enter password') !== -1) {
 			self.updateStatus(InstanceStatus.UnknownWarning, 'Authenticating')
 			self.log('info', 'Authentication requested. Sending password.')
 			self.sendCommand(self.config.password)
-		} else if (data.trim() == 'Welcome to Roland VR-400UHD.') {
+		} else if (data.trim().toLowerCase().indexOf('welcome to') !== -1) {
 			self.updateStatus(InstanceStatus.Ok)
 			self.log('info', 'Authenticated.')
 		} else if (data.trim() == 'ERR:0;') {
