@@ -2,143 +2,176 @@ const { InstanceStatus, TCPHelper } = require('@companion-module/base')
 
 module.exports = {
 	initTCP: function () {
-		let self = this
-		let receivebuffer = ''
+		const self = this
+		let databuffer = ''
 
-		if (self.socket !== undefined) {
+		// init/cleanup
+		if (self.socket) {
 			self.socket.destroy()
 			delete self.socket
 		}
+		self.config.port ??= 8023
+		self.commandQueue = []
+		self.draining = false
 
-		if (self.config.port === undefined) {
-			self.config.port = 8023
-		}
+		if (!self.config.host) return
 
-		if (self.config.host) {
-			self.socket = new TCPHelper(self.config.host, self.config.port)
+		self.socket = new TCPHelper(self.config.host, self.config.port)
 
-			let databuffer = ''
+		self.socket.on('error', (err) => {
+			self.log('error', 'Network error: ' + err.message)
+			self.stopPolling()
+			self.updateStatus(InstanceStatus.Connecting)
+		})
 
-			self.socket.on('error', function (err) {
-				self.log('error', 'Network error: ' + err.message)
-				self.stopPolling()
-				// Do not stay in OK status if device is off
-				self.updateStatus(InstanceStatus.Connecting)
-			})
+		self.socket.on('connect', () => {
+			self.updateStatus(InstanceStatus.Ok)
+			self.log('info', 'Connected')
+			self.getData() // seed queue
+			this.drainQueue() // kick off send of first command
+			self.startPolling()
+		})
 
-			self.socket.on('connect', function () {
-				self.updateStatus(InstanceStatus.Ok)
-				self.log('info', 'Connected')
-				self.getData() //get data once
-				self.startPolling()
-			})
+		self.socket.on('data', (buffer) => {
+			databuffer += buffer.toString('utf8')
 
-			self.socket.on('data', function (buffer) {
-				let indata = buffer.toString('utf8')
+			// split into complete lines; keep any partial
+			const lines = databuffer.split(/\r?\n/)
+			databuffer = lines.pop() // remainder (possibly empty)
 
-				databuffer += indata
-				//if a newline is present, process the data and clear databuffer
-				let newlineIndex = databuffer.indexOf('\n')
-				if (newlineIndex !== -1) {
-					//update feedbacks and variables
-					self.updateData(databuffer)
-					databuffer = ''
-				}
-			})
-		}
+			for (const line of lines) {
+				if (line.length) self.updateData(line)
+			}
+		})
 	},
 
 	startPolling() {
-		let self = this
-		self.log('debug', 'Start polling')
-		self.pollTimer = setInterval(() => {
-			self.getData()
-		}, 10000)
+		const self = this
+		const interval = Number(self.config.pollIntervalMs) || 1000
+		self.log('debug', `Start polling @ ${interval}ms`)
+		self.pollTimer = setInterval(() => self.getData(), interval)
 	},
 
 	stopPolling() {
-		let self = this
-
-		if (self.pollTimer !== undefined) {
+		const self = this
+		if (self.pollTimer) {
 			clearInterval(self.pollTimer)
 			delete self.pollTimer
 		}
 	},
 
 	getData() {
-		let self = this
-		self.addToQueue('get', 97, 46, 0) //pgm input
-		self.addToQueue('get', 97, 46, 1) //pst input
+		const self = this
+		self.addToQueue('get', 97, 46, 0) // pgm input
+		self.addToQueue('get', 97, 46, 1) // pst input
 	},
 
 	addToQueue(type, category, id, subId, value) {
-		let self = this
+		const self = this
 
-		let cmd = undefined
+		let cmd
+		if (type === 'set') cmd = `set,${category},${id},${subId},${value}`
+		else if (type === 'get') cmd = `get,${category},${id},${subId}`
 
-		if (type === 'set') {
-			cmd = `set,${category},${id},${subId},${value}`
-		} else if (type === 'get') {
-			cmd = `get,${category},${id},${subId}`
-		}
+		if (!cmd) return
+		if (self.config.verbose) self.log('debug', 'Adding command to queue: ' + cmd)
 
-		if (self.config.verbose) {
-			self.log('debug', 'Adding command to queue: ' + cmd)
-		}
-		
 		self.commandQueue.push(cmd)
+
+		// if nothing currently in-flight, start sending
+		if (!self.draining && self.socket?.isConnected) {
+			this.drainQueue()
+		}
 	},
 
-	sendCommand: function (cmd) {
-		let self = this
+	drainQueue() {
+		const self = this
+		if (self.draining) return
+		self.draining = true
 
-		if (cmd !== undefined) {
-			if (self.socket !== undefined && self.socket.isConnected) {
-				self.socket.send(cmd + '\n')
-				if (self.config.verbose) {
-					self.log('debug', 'Sent: ' + cmd)
-				}
-
-				//add to lastCommand
-				self.lastCommand = cmd
-			} else {
-				self.log('error', 'Socket not connected')
+		const next = () => {
+			const cmd = self.commandQueue.shift()
+			if (!cmd) {
+				self.draining = false
+				return
 			}
+			self.sendCommand(cmd)
+			// Wait for an ack before sending the next; updateData() will call next()
+			self._onAck = next
+		}
+		next()
+	},
+
+	sendCommand(cmd) {
+		const self = this
+		if (!cmd) return
+
+		if (self.socket && self.socket.isConnected) {
+			// CRLF to be safe
+			self.socket.send(cmd + '\r\n')
+			if (self.config.verbose) self.log('debug', 'Sent: ' + cmd)
+			self.lastCommand = cmd
+		} else {
+			self.log('error', 'Socket not connected')
 		}
 	},
 
-	updateData: function (data) {
-		let self = this
+	updateData(data) {
+		const self = this
+		if (self.config.verbose) self.log('debug', 'Received: ' + data)
 
-		if (self.config.verbose) {
-			self.log('debug', 'Received: ' + data)
-		}
+		const lower = data.trim().toLowerCase()
 
-		if (data.trim().toLowerCase().indexOf('enter password') !== -1) {
+		// authentication
+		if (/\bpassword\b/i.test(data)) {
 			self.updateStatus(InstanceStatus.UnknownWarning, 'Authenticating')
 			self.log('info', 'Authentication requested. Sending password.')
+			// If your device needs a command wrapper, adjust here:
+			// e.g. self.sendCommand(`password,${self.config.password}`)
 			self.sendCommand(self.config.password)
-		} else if (data.trim().toLowerCase().indexOf('welcome to') !== -1) {
+			return
+		}
+		if (lower.includes('welcome')) {
 			self.updateStatus(InstanceStatus.Ok)
 			self.log('info', 'Authenticated.')
-		} else if (data.trim() == 'ERR:0;') {
-			//an error with something that it received
-		} else {
-			//do stuff with the data
-			try {
-				if (data.indexOf('ack') !== -1) {
-					//acknowledgment received, send next command in queue
-					self.sendCommand(self.cmdQueue.shift())
+			return
+		}
 
-					//process the ack
-					//acks look like this: ack,97,46,0,[a][lf ]
-					//parts are ack, category, id, subId, value
-					let parts = data.split(',')
-				}
-			} catch (error) {
-				self.log('error', 'Error parsing incoming data: ' + error)
+		// ACK handling: ack,category,id,subId,value
+		if (lower.startsWith('ack,')) {
+			try {
+				const parts = data.split(',')
+				// parts[0] = 'ack'
+				// Do whatever you need with category/id/subId/value here
+
+				// send the next queued command
+				if (typeof self._onAck === 'function') self._onAck()
+			} catch (e) {
+				self.log('error', 'Error parsing ack: ' + e)
 				self.log('error', 'Data: ' + data)
 			}
+			return
+		}
+
+		// handle device errors
+		if (data.trim() === 'ERR:0;') {
+			// ...
+			return
+		}
+		//do stuff with the data
+		try {
+			if (data.indexOf('ack') !== -1) {
+				//acknowledgment received, send next command in queue
+				self.sendCommand(self.cmdQueue.shift())
+
+				//process the ack
+				//acks look like this: ack,97,46,0,[a][lf ]
+				//parts are ack, category, id, subId, value
+				let parts = data.split(',')
+			}
+		} catch (error) {
+			self.log('error', 'Error parsing incoming data: ' + error)
+			self.log('error', 'Data: ' + data)
 		}
 	},
 }
