@@ -31,7 +31,7 @@ class vr400uhdInstance extends InstanceBase {
 
 		this.pollTimer = undefined
 
-		this.commandQueue = []
+		this.cmdQueue = []
 	}
 
 	async destroy() {
